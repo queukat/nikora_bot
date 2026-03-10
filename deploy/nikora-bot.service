@@ -1,0 +1,18 @@
+[Unit]
+Description=Nikora Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/%i/nikora_bot
+Environment=TELEGRAM_BOT_TOKEN=PUT_TOKEN_HERE
+Environment=POLL_SECONDS=300
+# Environment=NIKORA_API_URL=https://nikora.above.ge/json/sales.php?callback=JSON_CALLBACK
+# Environment=NIKORA_BASE_URL=https://nikora.above.ge/
+ExecStart=/home/%i/nikora_bot/.venv/bin/python -m app.bot
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

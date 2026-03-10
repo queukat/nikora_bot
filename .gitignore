@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+app/__pycache__/
+*.py[cod]
+
+.idea/
+
+data/bot.db
+data/bot.db-shm
+data/bot.db-wal
+data/translations.template.json
+data/untranslated.json
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
