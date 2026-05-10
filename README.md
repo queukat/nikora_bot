@@ -1,5 +1,9 @@
 # Nikora Deals Telegram Bot (VPS Ubuntu)
 
+<!-- public-repo-status -->
+> Status: Active personal tool. Issues are kept simple; pull requests are welcome only when they match the current scope.
+
+
 ## 1) Установка
 
 ```bash
