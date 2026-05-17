@@ -65,6 +65,9 @@ def track_untranslated(cfg: Config, tr, deals: List[Deal]) -> int:
     """
     out_path = cfg.untranslated_path
     existing = _load_json_file(out_path)
+    translated_ids = {item_id for item_id in existing if item_id in tr.by_id}
+    for item_id in translated_ids:
+        existing.pop(item_id, None)
 
     now = to_iso_now()
     new_count = 0
@@ -84,7 +87,7 @@ def track_untranslated(cfg: Config, tr, deals: List[Deal]) -> int:
         }
         new_count += 1
 
-    if new_count > 0:
+    if new_count > 0 or translated_ids:
         _save_json_file(out_path, existing)
 
     return new_count
