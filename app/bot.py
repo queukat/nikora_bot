@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import html
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -31,6 +32,10 @@ SEARCH_PAGE_SIZE = 5  # чтобы поиск не спамил
 SEARCH_CANCEL_WORDS = {"отмена", "cancel", "стоп", "menu", "меню"}
 DEALS_CACHE_KEY = "deals_cache"
 DEALS_CACHE_AT_KEY = "deals_cache_at"
+
+
+def h(value: object) -> str:
+    return html.escape("" if value is None else str(value), quote=False)
 
 
 # ---------- untranslated dump ----------
@@ -244,12 +249,58 @@ def _build_subs_screen(subs: List[Subscription], by_id: Dict[str, Deal], tr) -> 
         deal = by_id.get(s.item_id)
         if deal:
             active_count += 1
-        name = tr.to_ru(deal.title, deal.id) if deal else "(не в текущих акциях)"
-        state = "🟢 активна" if deal else "⚪ не в текущих акциях"
-        lines.append(f"• <code>{s.item_id}</code> — {state}\n  └ {name}")
+        name = tr.to_ru(deal.title, deal.id) if deal else subscription_title(s, tr)
+        state = "🟢 активна" if deal else "⚪ закончилась или не в текущих акциях"
+        lines.append(f"• <b>{h(name)}</b>\n  <code>{h(s.item_id)}</code> - {state}")
 
     lines.insert(1, f"Сейчас активных: {active_count}")
     return "\n".join(lines), item_ids
+
+
+def save_subscription_snapshot(storage: Storage, chat_id: int, deal: Deal, title_ru: str) -> None:
+    storage.update_item_snapshot(
+        chat_id,
+        deal.id,
+        title_original=deal.title,
+        title_ru=title_ru,
+        old_price=deal.old_price,
+        new_price=deal.new_price,
+        start_date=deal.start_date,
+        end_date=deal.end_date,
+    )
+
+
+def save_subscription_snapshot_for_all(storage: Storage, deal: Deal, title_ru: str) -> None:
+    storage.update_item_snapshot_for_all(
+        deal.id,
+        title_original=deal.title,
+        title_ru=title_ru,
+        old_price=deal.old_price,
+        new_price=deal.new_price,
+        start_date=deal.start_date,
+        end_date=deal.end_date,
+    )
+
+
+def subscription_title(sub: Subscription, tr) -> str:
+    for value in (sub.title_ru, tr.title_for_id(sub.item_id), sub.title_original):
+        if value:
+            title = tr.clean(str(value))
+            if title:
+                return title
+    return "Название не сохранено"
+
+
+def format_subscription_snapshot(sub: Subscription, tr) -> str:
+    lines = [
+        f"🛒 <b>{h(subscription_title(sub, tr))}</b>",
+        f"🆔 <code>{h(sub.item_id)}</code>",
+    ]
+    if sub.new_price or sub.old_price:
+        lines.append(f"💸 {h(sub.new_price or '?')} (было {h(sub.old_price or '?')})")
+    if sub.start_date or sub.end_date:
+        lines.append(f"📅 {h(sub.start_date or '?')} → {h(sub.end_date or '?')}")
+    return "\n".join(lines)
 
 
 def _is_cancel_text(text: str) -> bool:
@@ -257,12 +308,12 @@ def _is_cancel_text(text: str) -> bool:
 
 
 def format_deal(cfg: Config, deal: Deal, title_ru: str) -> str:
-    dates = f"{deal.start_date} → {deal.end_date}"
+    dates = f"{h(deal.start_date)} → {h(deal.end_date)}"
     deadline = _deal_deadline_label(cfg, deal)
     return (
-        f"🛒 <b>{title_ru}</b>\n"
-        f"🆔 <code>{deal.id}</code>\n"
-        f"💸 {deal.new_price} (было {deal.old_price})\n"
+        f"🛒 <b>{h(title_ru)}</b>\n"
+        f"🆔 <code>{h(deal.id)}</code>\n"
+        f"💸 {h(deal.new_price)} (было {h(deal.old_price)})\n"
         f"📅 {dates}\n"
         f"{deadline}"
     )
@@ -299,10 +350,10 @@ async def send_deal_message(
             last_err = e
             continue
 
-    extra = f"\n🖼 {urls[0]}" if urls else ""
+    extra = f"\n🖼 {h(urls[0])}" if urls else ""
     sent = await bot.send_message(
         chat_id=chat_id,
-        text=caption + extra + (f"\n(error={last_err!r})" if last_err else ""),
+        text=caption + extra + (f"\n(error={h(repr(last_err))})" if last_err else ""),
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -579,6 +630,8 @@ async def show_deals(update: Update, context: ContextTypes.DEFAULT_TYPE, page: i
     for d in chunk:
         title_ru = tr.to_ru(d.title, d.id)
         subscribed = storage.is_subscribed(chat_id, d.id)
+        if subscribed:
+            save_subscription_snapshot(storage, chat_id, d, title_ru)
         sent_id = await send_deal_message(
             bot=context.bot,
             chat_id=chat_id,
@@ -610,22 +663,30 @@ async def show_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     subs = storage.list_subs(chat_id)
 
     if not subs:
-        await update.effective_message.reply_text(
-            "Подписок пока нет. Открой «Акции» или «Поиск» и нажми «Подписаться».",
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="Подписок пока нет. Открой «Акции» или «Поиск» и нажми «Подписаться».",
             reply_markup=main_menu_kb(),
         )
+        _save_deals_rendered(context, chat_id, [msg.message_id])
         return
 
     deals = await get_deals_cached(context, force_refresh=False)
     by_id: Dict[str, Deal] = {d.id: d for d in deals if d.id}
+    for sub in subs:
+        deal = by_id.get(sub.item_id)
+        if deal:
+            save_subscription_snapshot(storage, chat_id, deal, tr.to_ru(deal.title, deal.id))
 
     text, item_ids = _build_subs_screen(subs, by_id, tr)
 
-    await update.effective_message.reply_text(
-        text,
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
         parse_mode=ParseMode.HTML,
         reply_markup=subs_list_kb(item_ids),
     )
+    _save_deals_rendered(context, chat_id, [msg.message_id])
 
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -634,7 +695,13 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _clear_deals_rendered(context, chat_id)
     remind_days = storage.get_remind_days(chat_id)
     text = _settings_text(remind_days)
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_kb(remind_days))
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_kb(remind_days),
+    )
+    _save_deals_rendered(context, chat_id, [msg.message_id])
 
 
 async def show_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -644,18 +711,49 @@ async def show_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("search_query", None)
     context.user_data.pop("search_page", None)
 
-    await update.effective_message.reply_text(
-        "🔎 Введи слово для поиска (например: молоко, йогурт, кофе) или ID товара.\n"
-        "Можно отменить словом «отмена» и вернуться в меню.",
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🔎 Введи слово для поиска (например: молоко, йогурт, кофе) или ID товара.\n"
+            "Можно отменить словом «отмена» и вернуться в меню."
+        ),
         reply_markup=search_prompt_kb(),
     )
+    _save_deals_rendered(context, chat_id, [msg.message_id])
 
 
 def _norm(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = s.replace("«", '"').replace("»", '"')
+    s = (s or "").lower().replace("ё", "е").strip()
+    s = re.sub(r"(?<=\d)[,.](?=\d)", ".", s)
+    s = s.replace("«", " ").replace("»", " ").replace('"', " ")
+    s = re.sub(r"[^0-9a-zа-яა-ჰ%+./ ]+", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def _matches_query(query: str, deal: Deal, tr) -> bool:
+    q = _norm(query)
+    if not q:
+        return False
+
+    if q in _norm(deal.id):
+        return True
+
+    haystack = " ".join(
+        _norm(value)
+        for value in (
+            deal.title,
+            tr.to_ru(deal.title, deal.id),
+            tr.clean(deal.title),
+        )
+        if value
+    )
+
+    if q in haystack:
+        return True
+
+    terms = [term for term in q.split(" ") if term]
+    return bool(terms) and all(term in haystack for term in terms)
 
 
 async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str, page: int) -> None:
@@ -668,12 +766,9 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_t
     chat_id = update.effective_chat.id
     deals = await get_deals_cached(context, force_refresh=False)
 
-    q = _norm(query_text)
     matches: List[Deal] = []
     for d in deals:
-        t0 = _norm(d.title)
-        t1 = _norm(tr.to_ru(d.title, d.id))
-        if q in d.id.lower() or (q and (q in t0 or q in t1)):
+        if _matches_query(query_text, d, tr):
             matches.append(d)
 
     total = len(matches)
@@ -685,27 +780,36 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_t
     context.user_data["awaiting_search"] = False
 
     if total == 0:
+        await _clear_deals_rendered(context, chat_id)
         context.user_data["awaiting_search"] = True
-        await update.effective_message.reply_text(
-            "Ничего не нашёл 😿\n"
-            "Введи другой запрос или ID товара.",
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="Ничего не нашёл 😿\nВведи другой запрос или ID товара.",
             reply_markup=search_prompt_kb(),
         )
+        _save_deals_rendered(context, chat_id, [msg.message_id])
         return
 
     start = page * SEARCH_PAGE_SIZE
     end = min(total, start + SEARCH_PAGE_SIZE)
     chunk = matches[start:end]
+    rendered_ids: List[int] = []
 
-    await update.effective_message.reply_text(
-        f"🔎 Поиск: «{query_text}» — {start+1}-{end} из {total}",
-        reply_markup=search_nav_kb(page, SEARCH_PAGE_SIZE, total),
+    await _clear_deals_rendered(context, chat_id)
+
+    header = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🔎 Поиск: «{h(query_text)}» - {start+1}-{end} из {total}",
+        parse_mode=ParseMode.HTML,
     )
+    rendered_ids.append(header.message_id)
 
     for d in chunk:
         title_ru = tr.to_ru(d.title, d.id)
         subscribed = storage.is_subscribed(chat_id, d.id)
-        await send_deal_message(
+        if subscribed:
+            save_subscription_snapshot(storage, chat_id, d, title_ru)
+        sent_id = await send_deal_message(
             bot=context.bot,
             chat_id=chat_id,
             cfg=cfg,
@@ -714,6 +818,16 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_t
             title_ru=title_ru,
             subscribed=subscribed,
         )
+        if sent_id:
+            rendered_ids.append(sent_id)
+
+    nav = await context.bot.send_message(
+        chat_id=chat_id,
+        text="Листай результаты 👇",
+        reply_markup=search_nav_kb(page, SEARCH_PAGE_SIZE, total),
+    )
+    rendered_ids.append(nav.message_id)
+    _save_deals_rendered(context, chat_id, rendered_ids)
 
 
 async def export_dict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -762,13 +876,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.get("awaiting_search"):
         if _is_cancel_text(raw_text):
             context.user_data["awaiting_search"] = False
-            await update.effective_message.reply_text("Поиск отменён. Меню 👇", reply_markup=main_menu_kb())
+            await _clear_deals_rendered(context, update.effective_chat.id)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Поиск отменён. Меню 👇",
+                reply_markup=main_menu_kb(),
+            )
             return
         await run_search(update, context, query_text=raw_text, page=0)
         return
 
     if _is_cancel_text(raw_text):
-        await update.effective_message.reply_text("Меню 👇", reply_markup=main_menu_kb())
+        await _clear_deals_rendered(context, update.effective_chat.id)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Меню 👇",
+            reply_markup=main_menu_kb(),
+        )
         return
 
     text_norm = _norm(raw_text)
@@ -799,6 +923,10 @@ async def _refresh_subs_message(query, context: ContextTypes.DEFAULT_TYPE) -> No
 
     deals = await get_deals_cached(context, force_refresh=False)
     by_id: Dict[str, Deal] = {d.id: d for d in deals if d.id}
+    for sub in subs:
+        deal = by_id.get(sub.item_id)
+        if deal:
+            save_subscription_snapshot(storage, chat_id, deal, tr.to_ru(deal.title, deal.id))
 
     text, item_ids = _build_subs_screen(subs, by_id, tr)
 
@@ -876,7 +1004,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await answer_once()
             context.user_data["awaiting_search"] = False
             await _clear_deals_rendered(context, query.message.chat_id)
-            await query.message.reply_text("Меню 👇", reply_markup=main_menu_kb())
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Меню 👇",
+                reply_markup=main_menu_kb(),
+            )
             return
 
     if data.startswith("search|"):
@@ -945,14 +1077,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         deals = await get_deals_cached(context, force_refresh=False)
         deal = next((d for d in deals if d.id == item_id), None)
         if deal is None:
+            sub = next((s for s in storage.list_subs(chat_id) if s.item_id == item_id), None)
+            details = f"\n\n{format_subscription_snapshot(sub, tr)}" if sub else f"\n\n🆔 <code>{h(item_id)}</code>"
             await query.message.reply_text(
-                f"По подписке <code>{item_id}</code> сейчас нет активной акции.",
+                f"По подписке сейчас нет активной акции.{details}",
                 parse_mode=ParseMode.HTML,
             )
             return
 
         title_ru = tr.to_ru(deal.title, deal.id)
         subscribed = storage.is_subscribed(chat_id, deal.id)
+        if subscribed:
+            save_subscription_snapshot(storage, chat_id, deal, title_ru)
         await send_deal_message(
             bot=context.bot,
             chat_id=chat_id,
@@ -971,6 +1107,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if action == "sub":
             await answer_once("Подписка добавлена")
             storage.upsert_subscribe(query.message.chat_id, item_id)
+            tr = app_data["translator"]
+            deals = await get_deals_cached(context, force_refresh=False)
+            deal = next((d for d in deals if d.id == item_id), None)
+            if deal:
+                save_subscription_snapshot(storage, query.message.chat_id, deal, tr.to_ru(deal.title, deal.id))
             await query.edit_message_reply_markup(reply_markup=deal_kb(item_id, subscribed=True))
         elif action == "unsub":
             await answer_once("Подписка удалена")
@@ -1013,6 +1154,8 @@ async def poll_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
     active_deals.sort(key=deal_sort_key)
     _store_deals_cache(app_data, active_deals)
     by_id: Dict[str, Deal] = {d.id: d for d in active_deals if d.id}
+    for deal in active_deals:
+        save_subscription_snapshot_for_all(storage, deal, tr.to_ru(deal.title, deal.id))
     now = to_iso_now()
 
     for sub in list(storage.iter_all_subscriptions()):
@@ -1023,7 +1166,10 @@ async def poll_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     await context.bot.send_message(
                         chat_id=sub.chat_id,
-                        text=f"ℹ️ Акция по <code>{sub.item_id}</code> закончилась или пропала из списка.",
+                        text=(
+                            "ℹ️ <b>Акция закончилась или пропала из списка</b>\n\n"
+                            f"{format_subscription_snapshot(sub, tr)}"
+                        ),
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
@@ -1047,6 +1193,7 @@ async def poll_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
         should_send_update = (sub.last_hash_sent != h) or (not sub.is_active)
         if should_send_update:
             title_ru = tr.to_ru(deal.title, deal.id)
+            save_subscription_snapshot(storage, sub.chat_id, deal, title_ru)
             sent_ok = False
             try:
                 await send_deal_message(
@@ -1124,6 +1271,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     cfg = load_config()
 

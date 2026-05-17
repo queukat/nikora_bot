@@ -17,6 +17,12 @@ class Subscription:
     last_seen_at: Optional[str]
     last_end_reminder_sent: Optional[str]
     is_active: bool
+    title_original: Optional[str] = None
+    title_ru: Optional[str] = None
+    old_price: Optional[str] = None
+    new_price: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 
 class Storage:
@@ -31,7 +37,25 @@ class Storage:
 
     def init_schema(self, schema_sql: str) -> None:
         self._conn.executescript(schema_sql)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        columns = self._subscription_columns()
+        for name in (
+            "title_original",
+            "title_ru",
+            "old_price",
+            "new_price",
+            "start_date",
+            "end_date",
+        ):
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE subscriptions ADD COLUMN {name} TEXT")
+
+    def _subscription_columns(self) -> set[str]:
+        cur = self._conn.execute("PRAGMA table_info(subscriptions)")
+        return {str(row["name"]) for row in cur.fetchall()}
 
     # --- settings ---
 
@@ -64,7 +88,8 @@ class Storage:
     def list_subs(self, chat_id: int) -> List[Subscription]:
         cur = self._conn.execute(
             """
-            SELECT chat_id, item_id, created_at, last_hash_sent, last_seen_at, last_end_reminder_sent, is_active
+            SELECT chat_id, item_id, created_at, last_hash_sent, last_seen_at, last_end_reminder_sent,
+                   is_active, title_original, title_ru, old_price, new_price, start_date, end_date
             FROM subscriptions
             WHERE chat_id = ?
             ORDER BY created_at DESC
@@ -111,6 +136,68 @@ class Storage:
         )
         self._conn.commit()
 
+    def update_item_snapshot(
+        self,
+        chat_id: int,
+        item_id: str,
+        *,
+        title_original: Optional[str],
+        title_ru: Optional[str],
+        old_price: Optional[str],
+        new_price: Optional[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE subscriptions
+            SET title_original = COALESCE(NULLIF(?, ''), title_original),
+                title_ru = COALESCE(NULLIF(?, ''), title_ru),
+                old_price = COALESCE(NULLIF(?, ''), old_price),
+                new_price = COALESCE(NULLIF(?, ''), new_price),
+                start_date = COALESCE(NULLIF(?, ''), start_date),
+                end_date = COALESCE(NULLIF(?, ''), end_date)
+            WHERE chat_id = ? AND item_id = ?
+            """,
+            (
+                title_original,
+                title_ru,
+                old_price,
+                new_price,
+                start_date,
+                end_date,
+                chat_id,
+                item_id,
+            ),
+        )
+        self._conn.commit()
+
+    def update_item_snapshot_for_all(
+        self,
+        item_id: str,
+        *,
+        title_original: Optional[str],
+        title_ru: Optional[str],
+        old_price: Optional[str],
+        new_price: Optional[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE subscriptions
+            SET title_original = COALESCE(NULLIF(?, ''), title_original),
+                title_ru = COALESCE(NULLIF(?, ''), title_ru),
+                old_price = COALESCE(NULLIF(?, ''), old_price),
+                new_price = COALESCE(NULLIF(?, ''), new_price),
+                start_date = COALESCE(NULLIF(?, ''), start_date),
+                end_date = COALESCE(NULLIF(?, ''), end_date)
+            WHERE item_id = ?
+            """,
+            (title_original, title_ru, old_price, new_price, start_date, end_date, item_id),
+        )
+        self._conn.commit()
+
     def update_end_reminder_sent(self, chat_id: int, item_id: str, end_date: str) -> None:
         now = to_iso_now()
         self._conn.execute(
@@ -137,7 +224,8 @@ class Storage:
     def iter_all_subscriptions(self) -> Iterable[Subscription]:
         cur = self._conn.execute(
             """
-            SELECT chat_id, item_id, created_at, last_hash_sent, last_seen_at, last_end_reminder_sent, is_active
+            SELECT chat_id, item_id, created_at, last_hash_sent, last_seen_at, last_end_reminder_sent,
+                   is_active, title_original, title_ru, old_price, new_price, start_date, end_date
             FROM subscriptions
             """
         )
@@ -154,4 +242,10 @@ class Storage:
             last_seen_at=r["last_seen_at"],
             last_end_reminder_sent=r["last_end_reminder_sent"],
             is_active=bool(int(r["is_active"])),
+            title_original=r["title_original"],
+            title_ru=r["title_ru"],
+            old_price=r["old_price"],
+            new_price=r["new_price"],
+            start_date=r["start_date"],
+            end_date=r["end_date"],
         )

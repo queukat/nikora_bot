@@ -14,6 +14,51 @@ DEFAULT_REPLACEMENTS: Dict[str, str] = {
     " /": "/",
     "/ ": "/",
     "  ": " ",
+    "რძე": "молоко",
+    "იოგურტი": "йогурт",
+    "მაწონი": "мацони",
+    "არაჟანი": "сметана",
+    "ხაჭო": "творог",
+    "ნაღები": "сливки",
+    "კარაქი": "сливочное масло",
+    "ყველი": "сыр",
+    "სოსისი": "сосиски",
+    "ძეხვი": "колбаса",
+    "ქათამი": "курица",
+    "თევზი": "рыба",
+    "თინუსი": "тунец",
+    "პური": "хлеб",
+    "ლაფშა": "лапша",
+    "პელმენი": "пельмени",
+    "ხინკალი": "хинкали",
+    "წიწიბურა": "гречка",
+    "სიმინდი": "кукуруза",
+    "ბარდა": "горошек",
+    "ორცხობილა": "печенье",
+    "ჩიფსი": "чипсы",
+    "შოკოლადი": "шоколад",
+    "კანფეტი": "конфеты",
+    "ჩაი": "чай",
+    "ყავა": "кофе",
+    "ლუდი": "пиво",
+    "ღვინო": "вино",
+    "არაყი": "водка",
+    "ვისკი": "виски",
+    "ლიმონათი": "лимонад",
+    "წვენი": "сок",
+    "მაიონეზი": "майонез",
+    "ზეთი": "масло",
+    "პასტა": "паста",
+    "სოუსი": "соус",
+    "კარტოფილი": "картофель",
+    "ხახვი": "лук",
+    "ვაშლი": "яблоки",
+    "ავოკადო": "авокадо",
+    "მანგო": "манго",
+    "პომელო": "помело",
+    "შამპუნი": "шампунь",
+    "საპონი": "мыло",
+    "ხელსახოცი": "салфетки",
     "კგ": "кг",
     "ლ": "л",
     "მლ": "мл",
@@ -60,10 +105,12 @@ class Translator:
     def reload(self, translations_path: Path) -> None:
         self.by_id = load_translations(translations_path)
 
-    def to_ru(self, text: str, item_id: Optional[str] = None) -> str:
+    def title_for_id(self, item_id: Optional[str]) -> Optional[str]:
         if item_id and item_id in self.by_id:
-            return self.by_id[item_id]
+            return self.clean(self.by_id[item_id])
+        return None
 
+    def clean(self, text: str) -> str:
         if not text:
             return ""
 
@@ -77,11 +124,22 @@ class Translator:
             out.append(KA_TO_RU.get(ch, ch))
         s = "".join(out)
 
-        # чуть лечим пробелы/единицы
+        s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+        s = re.sub(r"\s*/\s*", "/", s)
         s = re.sub(r"\s{2,}", " ", s).strip()
         s = s.replace("« ", "«").replace(" »", "»")
 
         return s
+
+    def to_ru(self, text: str, item_id: Optional[str] = None) -> str:
+        from_dict = self.title_for_id(item_id)
+        if from_dict:
+            return from_dict
+
+        if not text:
+            return ""
+
+        return self.clean(text)
 
 
 def default_translator(translations_path: Path) -> Translator:
