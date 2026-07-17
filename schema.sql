@@ -23,4 +23,5 @@ CREATE TABLE IF NOT EXISTS chat_settings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_item ON subscriptions(item_id);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_chat ON subscriptions(chat_id);
+-- PRIMARY KEY (chat_id, item_id) already provides an index for chat_id lookups.
+DROP INDEX IF EXISTS idx_subscriptions_chat;

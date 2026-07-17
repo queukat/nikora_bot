@@ -14,3 +14,8 @@ data/untranslated.json
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Local diagnostics and temporary SSH credentials must never enter Git.
+codex-tmp/
+.codex_tmp_nikora_access*
+codex_tmp_nikora_access*

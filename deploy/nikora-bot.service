@@ -2,17 +2,48 @@
 Description=Nikora Telegram Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/home/%i/nikora_bot
-Environment=TELEGRAM_BOT_TOKEN=PUT_TOKEN_HERE
-Environment=POLL_SECONDS=300
-# Environment=NIKORA_API_URL=https://nikora.above.ge/json/sales.php?callback=JSON_CALLBACK
-# Environment=NIKORA_BASE_URL=https://nikora.above.ge/
-ExecStart=/home/%i/nikora_bot/.venv/bin/python -m app.bot
-Restart=always
-RestartSec=3
+User=nikora_bot
+Group=nikora_bot
+WorkingDirectory=/home/nikora_bot
+ExecStart=/home/nikora_bot/.venv/bin/python -m app.bot
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+EnvironmentFile=/etc/nikora-bot.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/home/nikora_bot/data
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=32
+MemoryHigh=128M
+MemoryMax=192M
 
 [Install]
 WantedBy=multi-user.target

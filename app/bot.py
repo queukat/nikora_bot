@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
+import asyncio
+from html import escape
 import logging
 import re
-import html
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Any
 from dateutil import tz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -21,8 +22,9 @@ from telegram.ext import (
 )
 
 from .config import Config, load_config
-from .nikora_api import Deal, NikoraApi
+from .nikora_api import Deal, DealsApi, EuroproductApi, NikoraApi
 from .storage import Storage, Subscription
+from .translation_store import load_json_object, track_untranslated
 from .translator import default_translator, write_translation_template
 from .utils import parse_ddmmyyyy, stable_hash, to_iso_now
 
@@ -32,65 +34,7 @@ SEARCH_PAGE_SIZE = 5  # чтобы поиск не спамил
 SEARCH_CANCEL_WORDS = {"отмена", "cancel", "стоп", "menu", "меню"}
 DEALS_CACHE_KEY = "deals_cache"
 DEALS_CACHE_AT_KEY = "deals_cache_at"
-
-
-def h(value: object) -> str:
-    return html.escape("" if value is None else str(value), quote=False)
-
-
-# ---------- untranslated dump ----------
-
-def _load_json_file(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_json_file(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def track_untranslated(cfg: Config, tr, deals: List[Deal]) -> int:
-    """
-    Сбрасывает в data/untranslated.json новые товары, которых нет в translations.json.
-    Формат:
-      {
-        "17533": {"orig": "...", "fallback": "...", "first_seen": "2026-02-19T...Z"}
-      }
-    """
-    out_path = cfg.untranslated_path
-    existing = _load_json_file(out_path)
-    translated_ids = {item_id for item_id in existing if item_id in tr.by_id}
-    for item_id in translated_ids:
-        existing.pop(item_id, None)
-
-    now = to_iso_now()
-    new_count = 0
-
-    for d in deals:
-        if not d.id:
-            continue
-        if d.id in tr.by_id:  # уже переведён словарём
-            continue
-        if d.id in existing:
-            continue
-
-        existing[d.id] = {
-            "orig": d.title,
-            "fallback": tr.to_ru(d.title, d.id),  # транслит/фолбэк
-            "first_seen": now,
-        }
-        new_count += 1
-
-    if new_count > 0 or translated_ids:
-        _save_json_file(out_path, existing)
-
-    return new_count
+DEALS_CACHE_LOCK_KEY = "deals_cache_lock"
 
 
 # ---------- UI keyboards ----------
@@ -252,9 +196,13 @@ def _build_subs_screen(subs: List[Subscription], by_id: Dict[str, Deal], tr) -> 
         deal = by_id.get(s.item_id)
         if deal:
             active_count += 1
-        name = tr.to_ru(deal.title, deal.id) if deal else subscription_title(s, tr)
+        if deal:
+            title_ru = tr.to_ru(deal.title, deal.id)
+            name = f"[{deal.source_label}] {title_ru}"
+        else:
+            name = subscription_title(s, tr)
         state = "🟢 активна" if deal else "⚪ закончилась или не в текущих акциях"
-        lines.append(f"• <b>{h(name)}</b>\n  <code>{h(s.item_id)}</code> - {state}")
+        lines.append(f"• <code>{escape(s.item_id)}</code> — {state}\n  └ {escape(name)}")
 
     lines.insert(1, f"Сейчас активных: {active_count}")
     return "\n".join(lines), item_ids
@@ -273,36 +221,31 @@ def save_subscription_snapshot(storage: Storage, chat_id: int, deal: Deal, title
     )
 
 
-def save_subscription_snapshot_for_all(storage: Storage, deal: Deal, title_ru: str) -> None:
-    storage.update_item_snapshot_for_all(
-        deal.id,
-        title_original=deal.title,
-        title_ru=title_ru,
-        old_price=deal.old_price,
-        new_price=deal.new_price,
-        start_date=deal.start_date,
-        end_date=deal.end_date,
-    )
-
-
 def subscription_title(sub: Subscription, tr) -> str:
-    for value in (sub.title_ru, tr.title_for_id(sub.item_id), sub.title_original):
-        if value:
-            title = tr.clean(str(value))
-            if title:
-                return title
+    for value in (sub.title_ru, tr.by_id.get(sub.item_id)):
+        title = str(value or "").strip()
+        if title:
+            return title
+    if sub.title_original:
+        title = tr.to_ru(sub.title_original, sub.item_id).strip()
+        if title:
+            return title
     return "Название не сохранено"
 
 
 def format_subscription_snapshot(sub: Subscription, tr) -> str:
     lines = [
-        f"🛒 <b>{h(subscription_title(sub, tr))}</b>",
-        f"🆔 <code>{h(sub.item_id)}</code>",
+        f"🛒 <b>{escape(subscription_title(sub, tr))}</b>",
+        f"🆔 <code>{escape(sub.item_id)}</code>",
     ]
     if sub.new_price or sub.old_price:
-        lines.append(f"💸 {h(sub.new_price or '?')} (было {h(sub.old_price or '?')})")
+        new_price = escape(sub.new_price or "?")
+        old_price = escape(sub.old_price or "?")
+        lines.append(f"💸 {new_price} (было {old_price})")
     if sub.start_date or sub.end_date:
-        lines.append(f"📅 {h(sub.start_date or '?')} → {h(sub.end_date or '?')}")
+        start_date = escape(sub.start_date or "?")
+        end_date = escape(sub.end_date or "?")
+        lines.append(f"📅 {start_date} → {end_date}")
     return "\n".join(lines)
 
 
@@ -310,23 +253,64 @@ def _is_cancel_text(text: str) -> bool:
     return _norm(text) in SEARCH_CANCEL_WORDS
 
 
+def _find_deal_by_id(deals: List[Deal], item_id: str) -> Optional[Deal]:
+    needle = item_id.strip()
+    if not needle:
+        return None
+
+    exact = next((d for d in deals if d.id == needle), None)
+    if exact is not None:
+        return exact
+
+    raw_matches = [d for d in deals if d.raw_id == needle]
+    if len(raw_matches) == 1:
+        return raw_matches[0]
+    return None
+
+
+def _resolve_subscription_item_id(subs: List[Subscription], item_id: str) -> Optional[str]:
+    needle = item_id.strip()
+    if not needle:
+        return None
+
+    exact = next((sub.item_id for sub in subs if sub.item_id == needle), None)
+    if exact is not None:
+        return exact
+
+    suffix_matches = [sub.item_id for sub in subs if sub.item_id.endswith(f":{needle}")]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
 def format_deal(cfg: Config, deal: Deal, title_ru: str) -> str:
-    dates = f"{h(deal.start_date)} → {h(deal.end_date)}"
-    deadline = _deal_deadline_label(cfg, deal)
-    return (
-        f"🛒 <b>{h(title_ru)}</b>\n"
-        f"🆔 <code>{h(deal.id)}</code>\n"
-        f"💸 {h(deal.new_price)} (было {h(deal.old_price)})\n"
-        f"📅 {dates}\n"
-        f"{deadline}"
-    )
+    lines = [
+        f"🛒 <b>{escape(title_ru)}</b>",
+        f"🏬 {escape(deal.source_label)}",
+        f"🆔 <code>{escape(deal.id)}</code>",
+    ]
+
+    new_price = escape(deal.new_price)
+    old_price = escape(deal.old_price)
+    if old_price:
+        lines.append(f"💸 {new_price} (было {old_price})")
+    else:
+        lines.append(f"💸 {new_price}")
+
+    if deal.start_date or deal.end_date:
+        start_date = escape(deal.start_date or "—")
+        end_date = escape(deal.end_date or "—")
+        lines.append(f"📅 {start_date} → {end_date}")
+        lines.append(_deal_deadline_label(cfg, deal))
+
+    return "\n".join(lines)
 
 
 async def send_deal_message(
     bot,
     chat_id: int,
     cfg: Config,
-    api: NikoraApi,
+    api: DealsApi,
     deal: Deal,
     title_ru: str,
     subscribed: bool,
@@ -353,10 +337,11 @@ async def send_deal_message(
             last_err = e
             continue
 
-    extra = f"\n🖼 {h(urls[0])}" if urls else ""
+    extra = f"\n🖼 {escape(urls[0])}" if urls else ""
+    error_text = f"\n(error={escape(repr(last_err))})" if last_err else ""
     sent = await bot.send_message(
         chat_id=chat_id,
-        text=caption + extra + (f"\n(error={h(repr(last_err))})" if last_err else ""),
+        text=caption + extra + error_text,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
@@ -408,7 +393,45 @@ def deal_sort_key(deal: Deal) -> tuple[int, int, str]:
 
 
 def _deals_cache_ttl_seconds(cfg: Config) -> int:
-    return max(30, min(cfg.poll_seconds, 900))
+    return cfg.deals_cache_ttl_seconds
+
+
+def _get_deals_lock(app_data: Dict[str, Any]) -> asyncio.Lock:
+    lock = app_data.get(DEALS_CACHE_LOCK_KEY)
+    if isinstance(lock, asyncio.Lock):
+        return lock
+    lock = asyncio.Lock()
+    app_data[DEALS_CACHE_LOCK_KEY] = lock
+    return lock
+
+
+def _item_source_key(item_id: str) -> str:
+    item_id = (item_id or "").strip()
+    if ":" in item_id:
+        return item_id.split(":", 1)[0]
+    return "nikora"
+
+
+def _get_last_cached_deals(app_data: Dict[str, Any]) -> List[Deal]:
+    deals = app_data.get(DEALS_CACHE_KEY)
+    if isinstance(deals, list):
+        return deals
+    return []
+
+
+def _merge_failed_source_deals(deals: List[Deal], cached_deals: List[Deal], failed_sources: set[str]) -> List[Deal]:
+    if not failed_sources or not cached_deals:
+        return deals
+
+    seen = {deal.id for deal in deals if deal.id}
+    merged = list(deals)
+    for deal in cached_deals:
+        if not deal.id or deal.id in seen:
+            continue
+        if _item_source_key(deal.id) in failed_sources:
+            merged.append(deal)
+            seen.add(deal.id)
+    return merged
 
 
 def _store_deals_cache(app_data: Dict[str, Any], deals: List[Deal]) -> None:
@@ -430,7 +453,7 @@ def _get_cached_deals(app_data: Dict[str, Any], cfg: Config) -> Optional[List[De
 
 async def get_deals_cached(context: ContextTypes.DEFAULT_TYPE, force_refresh: bool) -> List[Deal]:
     app_data = context.application.bot_data
-    api: NikoraApi = app_data["api"]
+    api: DealsApi = app_data["api"]
     cfg: Config = app_data["cfg"]
     tr = app_data["translator"]
 
@@ -439,15 +462,27 @@ async def get_deals_cached(context: ContextTypes.DEFAULT_TYPE, force_refresh: bo
         if cached is not None:
             return cached
 
-    deals = await api.fetch_deals()
-    deals = [d for d in deals if is_deal_active(cfg, d)]
-    deals.sort(key=deal_sort_key)
-    _store_deals_cache(app_data, deals)
+    async with _get_deals_lock(app_data):
+        if not force_refresh:
+            cached = _get_cached_deals(app_data, cfg)
+            if cached is not None:
+                return cached
 
-    # сбрасываем новые непереведённые
-    track_untranslated(cfg, tr, deals)
+        previous_cached = _get_last_cached_deals(app_data)
+        try:
+            deals = await api.fetch_deals()
+        except Exception as exc:
+            if previous_cached:
+                log.warning("Deals refresh failed; serving stale cache: %r", exc)
+                return previous_cached
+            raise
 
-    return deals
+        deals = _merge_failed_source_deals(deals, previous_cached, api.failed_sources())
+        deals = [d for d in deals if is_deal_active(cfg, d)]
+        deals.sort(key=deal_sort_key)
+        _store_deals_cache(app_data, deals)
+        track_untranslated(cfg.untranslated_path, tr, deals)
+        return deals
 
 
 # ---------- commands ----------
@@ -456,9 +491,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     await _clear_deals_rendered(context, chat_id)
     await update.effective_message.reply_text(
-        "Привет! Я помогаю быстро находить акции Nikora.\n\n"
+        "Привет! Я помогаю быстро находить акции Nikora и Europroduct.\n\n"
         "• Нажми «🔥 Акции», чтобы листать все предложения.\n"
-        "• Нажми «🔎 Поиск» или просто отправь текст/ID — найду сразу.\n"
+        "• Нажми «🔎 Поиск» или просто отправь текст/ID/название магазина — найду сразу.\n"
         "• В карточке товара жми «⭐ Подписаться», чтобы получать обновления.",
         reply_markup=main_menu_kb(),
     )
@@ -471,12 +506,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды:\n"
         "/deals — список акций\n"
         "/search — режим поиска\n"
-        "/search <запрос> — быстрый поиск (например: /search кофе)\n"
+        "/search <запрос> — быстрый поиск (например: /search кофе или /search europroduct)\n"
         "/subs — твои подписки\n"
         "/unsubscribe <id> — снять подписку по ID\n"
         "/check <id> — проверить картинку товара\n"
         "/settings — напоминания и словарь\n\n"
-        "Подсказка: можно просто отправить слово, и я выполню поиск.",
+        "Подсказка: можно просто отправить слово, ID или название магазина, и я выполню поиск.",
         reply_markup=main_menu_kb(),
     )
 
@@ -514,23 +549,25 @@ async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     item_id = context.args[0].strip()
     chat_id = update.effective_chat.id
+    resolved_item_id = _resolve_subscription_item_id(storage.list_subs(chat_id), item_id)
+    target_item_id = resolved_item_id or item_id
 
-    if not storage.is_subscribed(chat_id, item_id):
+    if not storage.is_subscribed(chat_id, target_item_id):
         await update.effective_message.reply_text(
             f"Подписки на {item_id} сейчас нет.",
             reply_markup=main_menu_kb(),
         )
         return
 
-    storage.unsubscribe(chat_id, item_id)
+    storage.unsubscribe(chat_id, target_item_id)
     await update.effective_message.reply_text(
-        f"Подписка на {item_id} удалена.",
+        f"Подписка на {target_item_id} удалена.",
         reply_markup=main_menu_kb(),
     )
 
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    api: NikoraApi = context.application.bot_data["api"]
+    api: DealsApi = context.application.bot_data["api"]
 
     if not context.args or not context.args[0].strip():
         await update.effective_message.reply_text(
@@ -542,7 +579,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     item_id = context.args[0].strip()
 
     try:
-        deals = await api.fetch_deals()
+        deals = await get_deals_cached(context, force_refresh=False)
     except Exception as e:
         log.exception("check fetch_deals failed for %s: %r", item_id, e)
         await update.effective_message.reply_text(
@@ -551,7 +588,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    deal = next((d for d in deals if d.id == item_id), None)
+    deal = _find_deal_by_id(deals, item_id)
     if deal is None:
         await update.effective_message.reply_text(
             f"Товар с ID {item_id} не найден в текущих акциях.",
@@ -586,7 +623,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_untranslated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     path = cfg.untranslated_path
-    if not path.exists():
+    if not load_json_object(path):
         await update.effective_message.reply_text("Пока нет непереведённых ✅", reply_markup=main_menu_kb())
         return
     await update.effective_message.reply_document(
@@ -600,7 +637,7 @@ async def cmd_untranslated(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def show_deals(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int, force_refresh: bool) -> None:
     app_data = context.application.bot_data
-    api: NikoraApi = app_data["api"]
+    api: DealsApi = app_data["api"]
     storage: Storage = app_data["storage"]
     tr = app_data["translator"]
     cfg: Config = app_data["cfg"]
@@ -666,12 +703,10 @@ async def show_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     subs = storage.list_subs(chat_id)
 
     if not subs:
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="Подписок пока нет. Открой «Акции» или «Поиск» и нажми «Подписаться».",
+        await update.effective_message.reply_text(
+            "Подписок пока нет. Открой «Акции» или «Поиск» и нажми «Подписаться».",
             reply_markup=main_menu_kb(),
         )
-        _save_deals_rendered(context, chat_id, [msg.message_id])
         return
 
     deals = await get_deals_cached(context, force_refresh=False)
@@ -681,15 +716,15 @@ async def show_subs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if deal:
             save_subscription_snapshot(storage, chat_id, deal, tr.to_ru(deal.title, deal.id))
 
+    subs = storage.list_subs(chat_id)
+
     text, item_ids = _build_subs_screen(subs, by_id, tr)
 
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
+    await update.effective_message.reply_text(
+        text,
         parse_mode=ParseMode.HTML,
         reply_markup=subs_list_kb(item_ids),
     )
-    _save_deals_rendered(context, chat_id, [msg.message_id])
 
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -698,13 +733,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _clear_deals_rendered(context, chat_id)
     remind_days = storage.get_remind_days(chat_id)
     text = _settings_text(remind_days)
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=settings_kb(remind_days),
-    )
-    _save_deals_rendered(context, chat_id, [msg.message_id])
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_kb(remind_days))
 
 
 async def show_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -714,54 +743,23 @@ async def show_search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("search_query", None)
     context.user_data.pop("search_page", None)
 
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "🔎 Введи слово для поиска (например: молоко, йогурт, кофе) или ID товара.\n"
-            "Можно отменить словом «отмена» и вернуться в меню."
-        ),
+    await update.effective_message.reply_text(
+        "🔎 Введи слово для поиска (например: молоко, йогурт, кофе) или ID товара.\n"
+        "Можно отменить словом «отмена» и вернуться в меню.",
         reply_markup=search_prompt_kb(),
     )
-    _save_deals_rendered(context, chat_id, [msg.message_id])
 
 
 def _norm(s: str) -> str:
-    s = (s or "").lower().replace("ё", "е").strip()
-    s = re.sub(r"(?<=\d)[,.](?=\d)", ".", s)
-    s = s.replace("«", " ").replace("»", " ").replace('"', " ")
-    s = re.sub(r"[^0-9a-zа-яა-ჰ%+./ ]+", " ", s)
+    s = (s or "").lower().strip()
+    s = s.replace("«", '"').replace("»", '"')
     s = re.sub(r"\s+", " ", s)
     return s
 
 
-def _matches_query(query: str, deal: Deal, tr) -> bool:
-    q = _norm(query)
-    if not q:
-        return False
-
-    if q in _norm(deal.id):
-        return True
-
-    haystack = " ".join(
-        _norm(value)
-        for value in (
-            deal.title,
-            tr.to_ru(deal.title, deal.id),
-            tr.clean(deal.title),
-        )
-        if value
-    )
-
-    if q in haystack:
-        return True
-
-    terms = [term for term in q.split(" ") if term]
-    return bool(terms) and all(term in haystack for term in terms)
-
-
 async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str, page: int) -> None:
     app_data = context.application.bot_data
-    api: NikoraApi = app_data["api"]
+    api: DealsApi = app_data["api"]
     storage: Storage = app_data["storage"]
     tr = app_data["translator"]
     cfg: Config = app_data["cfg"]
@@ -769,9 +767,13 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_t
     chat_id = update.effective_chat.id
     deals = await get_deals_cached(context, force_refresh=False)
 
+    q = _norm(query_text)
     matches: List[Deal] = []
     for d in deals:
-        if _matches_query(query_text, d, tr):
+        t0 = _norm(d.title)
+        t1 = _norm(tr.to_ru(d.title, d.id))
+        t2 = _norm(d.source_label)
+        if q in d.id.lower() or q in d.raw_id.lower() or (q and (q in t0 or q in t1 or q in t2)):
             matches.append(d)
 
     total = len(matches)
@@ -783,36 +785,29 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_t
     context.user_data["awaiting_search"] = False
 
     if total == 0:
-        await _clear_deals_rendered(context, chat_id)
         context.user_data["awaiting_search"] = True
-        msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="Ничего не нашёл 😿\nВведи другой запрос или ID товара.",
+        await update.effective_message.reply_text(
+            "Ничего не нашёл 😿\n"
+            "Введи другой запрос или ID товара.",
             reply_markup=search_prompt_kb(),
         )
-        _save_deals_rendered(context, chat_id, [msg.message_id])
         return
 
     start = page * SEARCH_PAGE_SIZE
     end = min(total, start + SEARCH_PAGE_SIZE)
     chunk = matches[start:end]
-    rendered_ids: List[int] = []
 
-    await _clear_deals_rendered(context, chat_id)
-
-    header = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔎 Поиск: «{h(query_text)}» - {start+1}-{end} из {total}",
-        parse_mode=ParseMode.HTML,
+    await update.effective_message.reply_text(
+        f"🔎 Поиск: «{query_text}» — {start+1}-{end} из {total}",
+        reply_markup=search_nav_kb(page, SEARCH_PAGE_SIZE, total),
     )
-    rendered_ids.append(header.message_id)
 
     for d in chunk:
         title_ru = tr.to_ru(d.title, d.id)
         subscribed = storage.is_subscribed(chat_id, d.id)
         if subscribed:
             save_subscription_snapshot(storage, chat_id, d, title_ru)
-        sent_id = await send_deal_message(
+        await send_deal_message(
             bot=context.bot,
             chat_id=chat_id,
             cfg=cfg,
@@ -821,28 +816,20 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query_t
             title_ru=title_ru,
             subscribed=subscribed,
         )
-        if sent_id:
-            rendered_ids.append(sent_id)
-
-    nav = await context.bot.send_message(
-        chat_id=chat_id,
-        text="Листай результаты 👇",
-        reply_markup=search_nav_kb(page, SEARCH_PAGE_SIZE, total),
-    )
-    rendered_ids.append(nav.message_id)
-    _save_deals_rendered(context, chat_id, rendered_ids)
 
 
 async def export_dict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app_data = context.application.bot_data
-    api: NikoraApi = app_data["api"]
     tr = app_data["translator"]
     cfg: Config = app_data["cfg"]
 
-    deals = await api.fetch_deals()
-    track_untranslated(cfg, tr, deals)
+    deals = await get_deals_cached(context, force_refresh=False)
+    track_untranslated(cfg.untranslated_path, tr, deals)
 
-    mapping = {d.id: tr.to_ru(d.title, d.id) for d in deals if d.id}
+    mapping = dict(tr.by_id)
+    for deal in deals:
+        if deal.id:
+            mapping.setdefault(deal.id, tr.to_ru(deal.title, deal.id))
 
     out_path = cfg.data_dir / "translations.template.json"
     write_translation_template(out_path, mapping)
@@ -850,7 +837,7 @@ async def export_dict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_document(
         document=out_path.open("rb"),
         filename="translations.template.json",
-        caption="📝 Шаблон словаря переводов. Сохрани как data/translations.json и перезагрузи словарь.",
+        caption="📝 Полный словарь плюс текущие позиции. Проверь новые значения и перезагрузи словарь.",
     )
 
 
@@ -859,9 +846,21 @@ async def reload_dict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     tr = app_data["translator"]
     cfg: Config = app_data["cfg"]
 
-    tr.reload(cfg.translations_path)
+    try:
+        tr.reload(cfg.translations_path, cfg.translation_memory_path)
+        observations = load_json_object(cfg.untranslated_path)
+        tr.import_translated_items(observations, prefer_observations=True)
+        tr.save_memory()
+        track_untranslated(cfg.untranslated_path, tr, [])
+    except Exception as exc:
+        log.warning("Dictionary reload rejected: %r", exc)
+        await update.effective_message.reply_text(
+            "Не удалось перезагрузить словарь: проверь JSON в translations.json и translation_memory.json.",
+            reply_markup=main_menu_kb(),
+        )
+        return
     await update.effective_message.reply_text(
-        f"Ок, словарь перезагружен: {cfg.translations_path.name}",
+        f"Ок, словарь перезагружен: {len(tr.by_id)} ID, {len(tr.by_text)} названий в памяти.",
         reply_markup=main_menu_kb(),
     )
 
@@ -879,23 +878,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.user_data.get("awaiting_search"):
         if _is_cancel_text(raw_text):
             context.user_data["awaiting_search"] = False
-            await _clear_deals_rendered(context, update.effective_chat.id)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Поиск отменён. Меню 👇",
-                reply_markup=main_menu_kb(),
-            )
+            await update.effective_message.reply_text("Поиск отменён. Меню 👇", reply_markup=main_menu_kb())
             return
         await run_search(update, context, query_text=raw_text, page=0)
         return
 
     if _is_cancel_text(raw_text):
-        await _clear_deals_rendered(context, update.effective_chat.id)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Меню 👇",
-            reply_markup=main_menu_kb(),
-        )
+        await update.effective_message.reply_text("Меню 👇", reply_markup=main_menu_kb())
         return
 
     text_norm = _norm(raw_text)
@@ -930,6 +919,8 @@ async def _refresh_subs_message(query, context: ContextTypes.DEFAULT_TYPE) -> No
         deal = by_id.get(sub.item_id)
         if deal:
             save_subscription_snapshot(storage, chat_id, deal, tr.to_ru(deal.title, deal.id))
+
+    subs = storage.list_subs(chat_id)
 
     text, item_ids = _build_subs_screen(subs, by_id, tr)
 
@@ -1007,11 +998,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await answer_once()
             context.user_data["awaiting_search"] = False
             await _clear_deals_rendered(context, query.message.chat_id)
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="Меню 👇",
-                reply_markup=main_menu_kb(),
-            )
+            await query.message.reply_text("Меню 👇", reply_markup=main_menu_kb())
             return
 
     if data.startswith("search|"):
@@ -1054,7 +1041,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "settings|untranslated":
         await answer_once()
         path = cfg.untranslated_path
-        if not path.exists():
+        if not load_json_object(path):
             await query.message.reply_text("Пока нет непереведённых ✅", reply_markup=main_menu_kb())
             return
         await query.message.reply_document(
@@ -1075,13 +1062,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await answer_once()
         item_id = data.split("|", 1)[1].strip()
         tr = app_data["translator"]
-        api: NikoraApi = app_data["api"]
+        api: DealsApi = app_data["api"]
         chat_id = query.message.chat_id
         deals = await get_deals_cached(context, force_refresh=False)
-        deal = next((d for d in deals if d.id == item_id), None)
+        deal = _find_deal_by_id(deals, item_id)
         if deal is None:
             sub = next((s for s in storage.list_subs(chat_id) if s.item_id == item_id), None)
-            details = f"\n\n{format_subscription_snapshot(sub, tr)}" if sub else f"\n\n🆔 <code>{h(item_id)}</code>"
+            details = f"\n\n{format_subscription_snapshot(sub, tr)}" if sub else ""
             await query.message.reply_text(
                 f"По подписке сейчас нет активной акции.{details}",
                 parse_mode=ParseMode.HTML,
@@ -1090,8 +1077,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         title_ru = tr.to_ru(deal.title, deal.id)
         subscribed = storage.is_subscribed(chat_id, deal.id)
-        if subscribed:
-            save_subscription_snapshot(storage, chat_id, deal, title_ru)
         await send_deal_message(
             bot=context.bot,
             chat_id=chat_id,
@@ -1110,10 +1095,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if action == "sub":
             await answer_once("Подписка добавлена")
             storage.upsert_subscribe(query.message.chat_id, item_id)
-            tr = app_data["translator"]
             deals = await get_deals_cached(context, force_refresh=False)
-            deal = next((d for d in deals if d.id == item_id), None)
+            deal = _find_deal_by_id(deals, item_id)
             if deal:
+                tr = app_data["translator"]
                 save_subscription_snapshot(storage, query.message.chat_id, deal, tr.to_ru(deal.title, deal.id))
             await query.edit_message_reply_markup(reply_markup=deal_kb(item_id, subscribed=True))
         elif action == "unsub":
@@ -1139,46 +1124,48 @@ def days_left_local(cfg: Config, end_date_str: str) -> Optional[int]:
 
 async def poll_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
     app_data = context.application.bot_data
-    api: NikoraApi = app_data["api"]
+    api: DealsApi = app_data["api"]
     storage: Storage = app_data["storage"]
     tr = app_data["translator"]
     cfg: Config = app_data["cfg"]
 
-    try:
-        deals = await api.fetch_deals()
-    except Exception as e:
-        log.exception("fetch_deals failed: %r", e)
-        return
+    async with _get_deals_lock(app_data):
+        try:
+            deals = await api.fetch_deals()
+        except Exception as e:
+            log.warning("Scheduled deals refresh failed: %r", e)
+            return
 
-    # сбрасываем новые непереведённые
-    track_untranslated(cfg, tr, deals)
+        failed_sources = api.failed_sources()
+        deals = _merge_failed_source_deals(deals, _get_last_cached_deals(app_data), failed_sources)
+        track_untranslated(cfg.untranslated_path, tr, deals)
 
-    active_deals = [d for d in deals if is_deal_active(cfg, d)]
-    active_deals.sort(key=deal_sort_key)
-    _store_deals_cache(app_data, active_deals)
+        active_deals = [d for d in deals if is_deal_active(cfg, d)]
+        active_deals.sort(key=deal_sort_key)
+        _store_deals_cache(app_data, active_deals)
     by_id: Dict[str, Deal] = {d.id: d for d in active_deals if d.id}
-    for deal in active_deals:
-        save_subscription_snapshot_for_all(storage, deal, tr.to_ru(deal.title, deal.id))
     now = to_iso_now()
 
     for sub in list(storage.iter_all_subscriptions()):
         deal = by_id.get(sub.item_id)
 
         if deal is None:
+            if _item_source_key(sub.item_id) in failed_sources:
+                continue
             if sub.is_active:
                 try:
                     await context.bot.send_message(
                         chat_id=sub.chat_id,
-                        text=(
-                            "ℹ️ <b>Акция закончилась или пропала из списка</b>\n\n"
-                            f"{format_subscription_snapshot(sub, tr)}"
-                        ),
+                        text=f"ℹ️ Акция по <code>{escape(sub.item_id)}</code> закончилась или пропала из списка.",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     pass
                 storage.mark_inactive(sub.chat_id, sub.item_id)
             continue
+
+        title_ru = tr.to_ru(deal.title, deal.id)
+        save_subscription_snapshot(storage, sub.chat_id, deal, title_ru)
 
         payload = {
             "id": deal.id,
@@ -1195,8 +1182,6 @@ async def poll_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         should_send_update = (sub.last_hash_sent != h) or (not sub.is_active)
         if should_send_update:
-            title_ru = tr.to_ru(deal.title, deal.id)
-            save_subscription_snapshot(storage, sub.chat_id, deal, title_ru)
             sent_ok = False
             try:
                 await send_deal_message(
@@ -1220,7 +1205,6 @@ async def poll_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
             dl = days_left_local(cfg, deal.end_date)
             if dl is not None and dl == remind_days:
                 if sub.last_end_reminder_sent != deal.end_date:
-                    title_ru = tr.to_ru(deal.title, deal.id)
                     sent_ok = False
                     try:
                         await send_deal_message(
@@ -1247,12 +1231,26 @@ def read_text(path: Path) -> str:
 
 
 async def on_shutdown(app: Application) -> None:
-    api: NikoraApi = app.bot_data.get("api")
+    api: DealsApi = app.bot_data.get("api")
     storage: Storage = app.bot_data.get("storage")
     if api:
         await api.close()
     if storage:
         storage.close()
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    if isinstance(error, NetworkError):
+        log.warning("Temporary Telegram network error: %s", error)
+        return
+    if error is None:
+        log.error("Unhandled Telegram update error without exception details")
+        return
+    log.error(
+        "Unhandled Telegram update error",
+        exc_info=(type(error), error, error.__traceback__),
+    )
 
 
 def _parse_daily_time(cfg: Config) -> Optional[dt_time]:
@@ -1275,7 +1273,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
     cfg = load_config()
 
@@ -1283,14 +1281,24 @@ def main() -> None:
     schema_sql = read_text(Path(__file__).resolve().parents[1] / "schema.sql")
     storage.init_schema(schema_sql)
 
-    api = NikoraApi(
+    nikora_api = NikoraApi(
         api_url=cfg.api_url,
         base_url=cfg.base_url,
         timeout_s=cfg.http_timeout_s,
         user_agent=cfg.http_user_agent,
     )
+    europroduct_api = None
+    if cfg.europroduct_enabled:
+        europroduct_api = EuroproductApi(
+            promo_url=cfg.europroduct_promo_url,
+            base_url=cfg.europroduct_base_url,
+            timeout_s=cfg.http_timeout_s,
+            user_agent=cfg.http_user_agent,
+            page_concurrency=cfg.europroduct_page_concurrency,
+        )
+    api = DealsApi(nikora=nikora_api, europroduct=europroduct_api)
 
-    translator = default_translator(cfg.translations_path)
+    translator = default_translator(cfg.translations_path, cfg.translation_memory_path)
 
     app = Application.builder().token(cfg.telegram_token).build()
     app.bot_data["cfg"] = cfg
@@ -1298,6 +1306,7 @@ def main() -> None:
     app.bot_data["api"] = api
     app.bot_data["translator"] = translator
 
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("deals", cmd_deals))
@@ -1314,10 +1323,19 @@ def main() -> None:
     # --- schedule polling ---
     daily_time = _parse_daily_time(cfg)
     if daily_time is not None:
-        app.job_queue.run_daily(poll_and_notify, time=daily_time)
+        app.job_queue.run_daily(
+            poll_and_notify,
+            time=daily_time,
+            job_kwargs={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
+        )
         log.info("Polling scheduled daily at %s (%s)", cfg.daily_poll_at, cfg.tz_name)
     else:
-        app.job_queue.run_repeating(poll_and_notify, interval=cfg.poll_seconds, first=5)
+        app.job_queue.run_repeating(
+            poll_and_notify,
+            interval=cfg.poll_seconds,
+            first=5,
+            job_kwargs={"coalesce": True, "max_instances": 1},
+        )
         log.info("Polling scheduled every %ss", cfg.poll_seconds)
 
     app.post_shutdown = on_shutdown

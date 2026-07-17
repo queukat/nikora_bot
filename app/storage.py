@@ -29,11 +29,20 @@ class Storage:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(self._db_path), timeout=5.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA journal_size_limit = 1048576")
+        self._conn.execute("PRAGMA wal_autocheckpoint = 250")
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.execute("PRAGMA optimize")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            self._conn.close()
 
     def init_schema(self, schema_sql: str) -> None:
         self._conn.executescript(schema_sql)
