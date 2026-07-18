@@ -19,6 +19,15 @@ class TranslatorTests(unittest.TestCase):
             "Hefi, вафельные палочки, 150 г",
         )
 
+    def test_reviewed_live_translation_is_kept_in_memory(self) -> None:
+        translator = default_translator(Path("data/translations.json"), Path("data/translation_memory.json"))
+        title = "მაკარონი მაკფა ვერმიშელი 400 გ"
+        self.assertEqual(
+            translator.to_ru(title, "europroduct:20F393EB4F"),
+            "Makfa, вермишель, 400 г",
+        )
+        self.assertEqual(translator.to_ru(title, "another-id"), "Makfa, вермишель, 400 г")
+
     def test_smart_fallback_for_europroduct_title(self) -> None:
         translator = default_translator(Path("missing-translations.json"))
         result = translator.to_ru("შვრიის ფანტელი 'სოლნიშკო' გარგრით 300გ")
