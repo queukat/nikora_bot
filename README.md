@@ -99,6 +99,18 @@ python -m scripts.build_translation_memory \
 
 Неоднозначные нормализованные названия намеренно не переиспользуются.
 
+Для контроля качества русских названий:
+
+```bash
+# Словарь и память переводов
+python -m scripts.audit_translation_quality --min-score 0.90
+
+# Текущая выгрузка Nikora и Europroduct
+python -m scripts.audit_live_translations --min-score 0.90
+```
+
+Эти проверки не переводят товары автоматически: они отмечают тексты, слишком похожие на механическую транслитерацию грузинского исходника, для последующей ручной вычитки.
+
 ## License
 
 <!-- commercial-license-policy -->

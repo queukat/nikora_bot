@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from dataclasses import field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -59,6 +60,32 @@ KA_TO_RU = {
     "შ": "ш", "ჩ": "ч", "ც": "ц", "ძ": "дз", "წ": "ц", "ჭ": "ч", "ხ": "х", "ჯ": "дж",
     "ჰ": "х",
 }
+
+
+_GEORGIAN_RE = re.compile(r"[\u10A0-\u10FF]")
+_CYRILLIC_RE = re.compile(r"[а-яё]", flags=re.IGNORECASE)
+_TRANSLITERATION_COMPARE_RE = re.compile(r"[^a-zа-яё0-9]+", flags=re.IGNORECASE)
+
+
+def transliterate_georgian(text: str) -> str:
+    """Mechanical Georgian-to-Cyrillic rendering, used only for quality checks."""
+    return "".join(KA_TO_RU.get(char, char) for char in str(text or ""))
+
+
+def transliteration_similarity(source_text: str, translation: str) -> float:
+    """Return how closely a Russian value resembles a raw Georgian transliteration."""
+    source = str(source_text or "")
+    value = str(translation or "")
+    if not _GEORGIAN_RE.search(source) or not _CYRILLIC_RE.search(value):
+        return 0.0
+
+    transliterated = _TRANSLITERATION_COMPARE_RE.sub(" ", transliterate_georgian(source).lower())
+    translated = _TRANSLITERATION_COMPARE_RE.sub(" ", value.lower())
+    transliterated = re.sub(r"\s+", " ", transliterated).strip()
+    translated = re.sub(r"\s+", " ", translated).strip()
+    if not transliterated or not translated:
+        return 0.0
+    return SequenceMatcher(None, transliterated, translated).ratio()
 
 
 def _load_string_mapping(path: Path, label: str) -> Dict[str, str]:

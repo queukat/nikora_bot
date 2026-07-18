@@ -3,10 +3,22 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.translator import default_translator
+from app.translator import default_translator, transliteration_similarity
 
 
 class TranslatorTests(unittest.TestCase):
+    def test_transliteration_quality_score_detects_raw_fallback(self) -> None:
+        source = "„ჰეფი“ ვაფლის ჩხირი 150 გ"
+        self.assertGreaterEqual(transliteration_similarity(source, "«хефи» вафлис чхири 150 г"), 0.99)
+        self.assertLess(transliteration_similarity(source, "Hefi, вафельные палочки, 150 г"), 0.80)
+
+    def test_reviewed_hefi_translation_overrides_old_transliteration(self) -> None:
+        translator = default_translator(Path("data/translations.json"), Path("data/translation_memory.json"))
+        self.assertEqual(
+            translator.to_ru("„ჰეფი“ ვაფლის ჩხირი 150 გ", "16196"),
+            "Hefi, вафельные палочки, 150 г",
+        )
+
     def test_smart_fallback_for_europroduct_title(self) -> None:
         translator = default_translator(Path("missing-translations.json"))
         result = translator.to_ru("შვრიის ფანტელი 'სოლნიშკო' გარგრით 300გ")
